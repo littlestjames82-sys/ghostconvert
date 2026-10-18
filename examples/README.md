@@ -1,6 +1,32 @@
 # GhostConvert examples
 
-One small bundle, converted to all four targets.
+One small bundle, converted to all four targets. If you have no
+GhostSlice bundle of your own yet, start here: everything below runs
+against the sample bundle committed in this directory.
+
+Try it in two commands, from the GhostConvert checkout:
+
+```sh
+# Summarise the sample bundle, writing nothing
+PYTHONPATH=src python3 -m ghostconvert inspect examples/sample_bundle
+
+# Convert it for AGENTS.md readers, into a scratch directory
+PYTHONPATH=src python3 -m ghostconvert convert \
+  examples/sample_bundle --to agents -o /tmp/ghostconvert-demo
+```
+
+The inspect summary for this bundle reads, in part:
+
+```text
+Project: sample_project
+Sliced by: ghostslice 1.0.6 (preset: claude-code)
+Files: 7 (5 with bodies, 1 emptied by GhostSlice, 1 excluded)
+Totals: 211 sliced of 287 original estimated tokens (method: ...)
+Emptied by GhostSlice (no body by design): tests/test_app.py (mode: strip-tests)
+```
+
+(The token method string is longer in the real output; it is quoted
+from the manifest, not computed by GhostConvert.)
 
 ## What is here
 

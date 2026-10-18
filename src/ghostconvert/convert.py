@@ -34,6 +34,9 @@ def _fence(body: str, language: str) -> str:
 
 
 def _header_lines(bundle: Bundle, target: str) -> list[str]:
+    """The conversion header every artifact opens with: provenance,
+    project name, the manifest's token totals when recorded, and the
+    warning that a non-full slice mode is not the full source."""
     m = bundle.manifest
     total_after = m.get("total_sliced_tokens")
     total_before = m.get("total_original_tokens")
@@ -59,6 +62,8 @@ def _header_lines(bundle: Bundle, target: str) -> list[str]:
 
 
 def _section(f: BundleFile, heading: str = "##") -> str:
+    """One file's section: a header carrying its slice mode label,
+    then its body in a fenced code block."""
     return (f"{heading} File: {f.path} (mode: {f.mode_label})\n\n"
             f"{_fence(f.body or '', f.language)}\n")
 
@@ -74,16 +79,21 @@ def _render_single(bundle: Bundle, target: str, title: str) -> str:
 
 
 def render_agents(bundle: Bundle) -> str:
+    """Render the ``agents`` target: one ``AGENTS.md`` document."""
     return _render_single(bundle, "agents",
                           "AGENTS.md (GhostSlice context, converted)")
 
 
 def render_copilot(bundle: Bundle) -> str:
+    """Render the ``copilot`` target: one Copilot instructions file,
+    with the same section discipline as ``agents``."""
     return _render_single(bundle, "copilot",
                           "Copilot instructions (GhostSlice context, converted)")
 
 
 def render_generic(bundle: Bundle) -> str:
+    """Render the ``generic`` target: one plain ``prompt.md``, bodies
+    unfenced under ``# File:`` headers, closest to Slice's PROMPT.md."""
     parts = ["# Converted agent context (GhostConvert, from a GhostSlice bundle)\n\n"]
     parts.append("\n".join(_header_lines(bundle, "generic")) + "\n")
     for f in bundle.included:
@@ -95,11 +105,14 @@ def render_generic(bundle: Bundle) -> str:
 
 
 def _group_key(path: str) -> str:
+    """Cursor grouping key: a path's top-level directory, or ``root``
+    for files that sit at the project root."""
     parts = path.split("/")
     return parts[0] if len(parts) > 1 else "root"
 
 
 def _group_slug(group: str) -> str:
+    """Filesystem-safe slug for a group name, used in rule filenames."""
     slug = re.sub(r"[^a-z0-9]+", "-", group.lower()).strip("-")
     return slug or "root"
 
@@ -112,8 +125,18 @@ def render_cursor(bundle: Bundle) -> dict[str, str]:
             continue
         groups.setdefault(_group_key(f.path), []).append(f)
     out: dict[str, str] = {}
+    used_slugs: set[str] = set()
     for group, members in groups.items():
         slug = _group_slug(group)
+        # Distinct groups can slugify to the same name ("My Docs" and
+        # "my-docs" both become "my-docs"). Without disambiguation the
+        # later group would silently overwrite the earlier rule file
+        # and its files would vanish from the output with no loss named.
+        base_slug, suffix = slug, 2
+        while slug in used_slugs:
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+        used_slugs.add(slug)
         globs = ", ".join(f.path for f in members)
         parts = [
             "---\n",
@@ -264,6 +287,9 @@ def compute_losses(bundle: Bundle, target: str) -> list[tuple[str, str]]:
 
 def render_losses(bundle: Bundle, target: str,
                   losses: list[tuple[str, str]]) -> str:
+    """Render the losses list as the ``LOSSES.md`` shipped with every
+    conversion. An empty list still produces a note that says so, so
+    the file is never simply absent."""
     parts = [f"# Conversion losses: {target}\n\n",
              f"Source bundle: {bundle.root}\n",
              f"Project: {bundle.project_name}\n",

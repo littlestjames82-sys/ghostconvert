@@ -68,6 +68,15 @@ def parse_prompt_bodies(prompt_text: str) -> dict[str, str]:
 
 
 class BundleFile:
+    """One manifest entry plus the body resolved for it, if any.
+
+    ``body`` starts as ``None`` and is filled in by :func:`load_bundle`
+    from ``files/<path>`` or, failing that, from ``PROMPT.md``; a file
+    whose body stays ``None`` is either :attr:`emptied_by_design` or
+    :attr:`missing_body` (or excluded). ``body_source`` records which
+    source supplied the body: ``"files"``, ``"prompt"``, or ``None``.
+    """
+
     def __init__(self, entry: dict):
         self.entry = entry
         self.path = entry.get("path", "")
@@ -119,6 +128,10 @@ class BundleFile:
 
 
 class Bundle:
+    """A loaded GhostSlice bundle: its manifest, its files in manifest
+    order (excluded entries included), and any manifest paths that were
+    skipped because they would escape the bundle directory."""
+
     def __init__(self, root: Path, manifest: dict, files: list[BundleFile],
                  skipped_paths: list[str]):
         self.root = root
@@ -133,14 +146,30 @@ class Bundle:
 
     @property
     def included(self) -> list[BundleFile]:
+        """Files GhostSlice did not exclude, in manifest order."""
         return [f for f in self.files if not f.excluded]
 
     @property
     def excluded(self) -> list[BundleFile]:
+        """Files GhostSlice excluded; they appear in no target."""
         return [f for f in self.files if f.excluded]
 
 
 def load_bundle(bundle_dir: str | Path) -> Bundle:
+    """Load a bundle directory read-only and return a :class:`Bundle`.
+
+    The manifest's ``files`` list drives everything: entry order is
+    preserved, excluded entries get no body lookup, and each included
+    entry's body comes from ``files/<path>`` first, then from the
+    matching ``PROMPT.md`` section. Manifest paths that escape the
+    bundle are collected in ``Bundle.skipped_paths``, never followed.
+
+    Raises:
+        BundleError: the directory or ``manifest.json`` is missing,
+            the manifest is malformed or has no ``files`` list, or no
+            entry has a readable body at all. The CLI maps this to
+            exit code 2.
+    """
     root = Path(bundle_dir).resolve()
     if not root.is_dir():
         raise BundleError(f"bundle directory not found: {bundle_dir}")
@@ -151,6 +180,13 @@ def load_bundle(bundle_dir: str | Path) -> Bundle:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BundleError(f"manifest.json is unreadable or malformed: {exc}")
+    if not isinstance(manifest, dict):
+        raise BundleError("manifest.json is malformed: its top level is "
+                          "not a JSON object")
+    if manifest.get("root") is not None and not isinstance(
+            manifest.get("root"), str):
+        raise BundleError("manifest.json is malformed: 'root' is not a "
+                          "string")
     entries = manifest.get("files")
     if not isinstance(entries, list):
         raise BundleError("manifest.json has no 'files' list")
@@ -171,9 +207,38 @@ def load_bundle(bundle_dir: str | Path) -> Bundle:
 
     files: list[BundleFile] = []
     skipped: list[str] = []
-    for entry in entries:
-        if not isinstance(entry, dict) or not entry.get("path"):
-            continue
+    for index, entry in enumerate(entries):
+        # A malformed entry must not be dropped silently (every loss has
+        # to be named) or crash the renderers later with a traceback:
+        # it makes the manifest malformed, which exits 2.
+        if not isinstance(entry, dict):
+            raise BundleError(
+                f"manifest.json is malformed: files entry {index} is "
+                f"not an object")
+        if not isinstance(entry.get("path"), str) or not entry["path"]:
+            raise BundleError(
+                f"manifest.json is malformed: files entry {index} has "
+                f"no string 'path'")
+        for field in ("mode", "language", "package", "sha256"):
+            if field not in entry:
+                continue
+            value = entry[field]
+            # 'package' and 'sha256' may legitimately be null; a null
+            # 'mode' or 'language' is malformed.
+            if value is None and field in ("package", "sha256"):
+                continue
+            if not isinstance(value, str):
+                raise BundleError(
+                    f"manifest.json is malformed: files entry {index} "
+                    f"({entry['path']}) has a non-string '{field}'")
+        symbols = entry.get("symbols_included")
+        if symbols is not None and (
+                not isinstance(symbols, (list, tuple))
+                or not all(isinstance(s, str) for s in symbols)):
+            raise BundleError(
+                f"manifest.json is malformed: files entry {index} "
+                f"({entry['path']}) has a non-string-list "
+                f"'symbols_included'")
         bf = BundleFile(entry)
         if bf.excluded:
             files.append(bf)

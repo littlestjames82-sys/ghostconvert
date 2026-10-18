@@ -1,6 +1,13 @@
-"""GhostConvert CLI: convert | inspect | targets.
+"""GhostConvert CLI: convert | inspect | targets | verify.
+
+Examples:
+    ghostconvert inspect path/to/.claude_context
+    ghostconvert convert path/to/.claude_context --to agents -o out/agents
+    ghostconvert convert path/to/.claude_context --to all -o out/all
+    ghostconvert targets
 
 Exit codes: 0 = done (losses recorded in LOSSES.md are not failures),
+1 = verify found a converted output that does not match its bundle,
 2 = bad bundle or bad arguments, source bundle never modified.
 """
 from __future__ import annotations
@@ -13,9 +20,11 @@ from pathlib import Path
 from . import __version__
 from .bundle import BundleError, load_bundle
 from .convert import TARGETS, TARGET_ARTIFACTS, convert
+from .verify import verify_target
 
 
 def _cmd_targets(_args) -> int:
+    """Print the four conversion targets and the artifact each writes."""
     print("GhostConvert targets:")
     for t in TARGETS:
         print(f"  {t:8} -> {TARGET_ARTIFACTS[t]}")
@@ -24,6 +33,8 @@ def _cmd_targets(_args) -> int:
 
 
 def _cmd_inspect(args) -> int:
+    """Print a bundle summary (project, file census by slice mode,
+    token totals, emptied/missing/skipped files) and write nothing."""
     try:
         bundle = load_bundle(args.bundle)
     except BundleError as exc:
@@ -90,13 +101,21 @@ def _write_artifacts(outdir: Path, artifacts: dict[str, str],
     written = []
     for rel, text in artifacts.items():
         dest = outdir / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text, encoding="utf-8")
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            print(f"ghostconvert: could not write {dest}: {exc}",
+                  file=sys.stderr)
+            return None
         written.append(rel)
     return written
 
 
 def _cmd_convert(args) -> int:
+    """Convert a bundle to one target (or all four, one subdirectory
+    per target), refusing output inside the bundle and refusing to
+    overwrite existing artifacts without --force."""
     try:
         bundle = load_bundle(args.bundle)
     except BundleError as exc:
@@ -109,9 +128,25 @@ def _cmd_convert(args) -> int:
               file=sys.stderr)
         return 2
     targets = list(TARGETS) if args.to == "all" else [args.to]
+    # Plan every target before writing any of them: with --to all, a
+    # collision (or any other refusal) in a later target must not leave
+    # earlier targets already written behind a failed exit code.
+    plans = []
     for target in targets:
         outdir = out_base / target if args.to == "all" else out_base
         artifacts, losses = convert(bundle, target)
+        plans.append((target, outdir, artifacts, losses))
+    if not args.force:
+        collisions = [str(outdir / rel)
+                      for _t, outdir, artifacts, _l in plans
+                      for rel in artifacts if (outdir / rel).exists()]
+        if collisions:
+            print("ghostconvert: refusing to overwrite existing file(s) "
+                  "(use --force to replace):", file=sys.stderr)
+            for c in collisions:
+                print(f"  {c}", file=sys.stderr)
+            return 2
+    for target, outdir, artifacts, losses in plans:
         written = _write_artifacts(outdir, artifacts, args.force)
         if written is None:
             return 2
@@ -127,32 +162,128 @@ def _cmd_convert(args) -> int:
     return 0
 
 
+def _cmd_verify(args) -> int:
+    try:
+        bundle = load_bundle(args.bundle)
+    except BundleError as exc:
+        print(f"ghostconvert: {exc}", file=sys.stderr)
+        return 2
+    out_base = Path(args.output)
+    targets = list(TARGETS) if args.to == "all" else [args.to]
+    failed = False
+    for target in targets:
+        outdir = out_base / target if args.to == "all" else out_base
+        issues = verify_target(bundle, target, outdir)
+        if issues:
+            failed = True
+            print(f"[{target}] FAILED: {len(issues)} issue(s) in {outdir}")
+            for issue in issues:
+                print(f"  {issue}")
+        else:
+            n_artifacts = len(convert(bundle, target)[0])
+            bodies = sum(1 for f in bundle.included if f.body is not None)
+            print(f"[{target}] OK: {n_artifacts} artifact(s) match a fresh "
+                  f"conversion of this bundle ({bodies} file(s) with "
+                  f"bodies, manifest order, mode labels, bodies verbatim, "
+                  f"LOSSES.md current)")
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Parse arguments and dispatch to the chosen subcommand.
+
+    Returns the process exit code: 0 on success, 1 when verify
+    finds an output that does not match its bundle, 2 on a bad
+    bundle or bad arguments (argparse itself also exits 2 on bad
+    usage).
+    """
     parser = argparse.ArgumentParser(
         prog="ghostconvert",
-        description="Convert a GhostSlice bundle into other agent "
-                    "instruction formats, naming what each format loses.")
+        description="Convert a GhostSlice bundle (a .claude_context "
+                    "directory with manifest.json, PROMPT.md, and "
+                    "files/) into other agent instruction formats, "
+                    "naming what each format loses in LOSSES.md. The "
+                    "source bundle is read only, never modified.",
+        epilog="examples:\n"
+               "  ghostconvert inspect path/to/.claude_context\n"
+               "  ghostconvert convert path/to/.claude_context "
+               "--to agents -o out/agents\n"
+               "  ghostconvert convert path/to/.claude_context "
+               "--to all -o out/all\n"
+               "  ghostconvert targets\n"
+               "\n"
+               "exit codes: 0 = converted (losses, if any, are listed "
+               "in LOSSES.md and are not failures); 1 = verify found "
+               "an output that does not match its bundle; 2 = bad "
+               "bundle or bad arguments.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version",
                         version=f"ghostconvert {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_targets = sub.add_parser("targets", help="list conversion targets")
+    p_targets = sub.add_parser(
+        "targets",
+        help="list conversion targets",
+        description="List the four conversion targets and the "
+                    "artifact path each one writes. Every target also "
+                    "writes a LOSSES.md next to its artifact(s).")
     p_targets.set_defaults(func=_cmd_targets)
 
-    p_inspect = sub.add_parser("inspect", help="summarise a bundle, write nothing")
-    p_inspect.add_argument("bundle", help="path to the GhostSlice bundle directory")
+    p_inspect = sub.add_parser(
+        "inspect",
+        help="summarise a bundle, write nothing",
+        description="Summarise a GhostSlice bundle: project, file "
+                    "census by slice mode, token totals, and any "
+                    "emptied, missing, or skipped files. Writes "
+                    "nothing and never modifies the bundle.")
+    p_inspect.add_argument(
+        "bundle",
+        help="path to the GhostSlice bundle directory "
+             "(the folder containing manifest.json)")
     p_inspect.set_defaults(func=_cmd_inspect)
 
-    p_convert = sub.add_parser("convert", help="convert a bundle to a target format")
-    p_convert.add_argument("bundle", help="path to the GhostSlice bundle directory")
+    p_convert = sub.add_parser(
+        "convert",
+        help="convert a bundle to a target format",
+        description="Convert a GhostSlice bundle to a target format. "
+                    "The output also contains LOSSES.md, naming "
+                    "everything the target format could not carry "
+                    "from the manifest. Nothing is written into the "
+                    "source bundle.",
+        epilog="The output directory must not be the bundle directory "
+               "or inside it. Existing artifacts are overwritten only "
+               "with --force; without it the run refuses, names the "
+               "collision, and writes nothing.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_convert.add_argument(
+        "bundle",
+        help="path to the GhostSlice bundle directory "
+             "(the folder containing manifest.json)")
     p_convert.add_argument("--to", required=True,
                            choices=[*TARGETS, "all"],
-                           help="target format (all = one subdirectory per target)")
+                           metavar="TARGET",
+                           help="target format: agents, cursor, copilot, "
+                                "or generic (all = every target, one "
+                                "subdirectory per target)")
     p_convert.add_argument("-o", "--out", required=True,
-                           help="output directory (must not be inside the bundle)")
+                           help="output directory (created if needed; "
+                                "must not be the bundle or inside it)")
     p_convert.add_argument("--force", action="store_true",
-                           help="overwrite artifacts that already exist")
+                           help="overwrite artifact files that already "
+                                "exist in the output directory")
     p_convert.set_defaults(func=_cmd_convert)
+
+    p_verify = sub.add_parser(
+        "verify",
+        help="check a converted output against its bundle, write nothing")
+    p_verify.add_argument("bundle", help="path to the GhostSlice bundle directory")
+    p_verify.add_argument("output",
+                          help="converted output directory (for --to all, "
+                               "the directory holding one subdirectory per target)")
+    p_verify.add_argument("--to", required=True,
+                          choices=[*TARGETS, "all"],
+                          help="target format the output was converted to")
+    p_verify.set_defaults(func=_cmd_verify)
 
     args = parser.parse_args(argv)
     return args.func(args)
